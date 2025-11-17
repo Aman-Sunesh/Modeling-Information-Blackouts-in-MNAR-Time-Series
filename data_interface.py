@@ -335,3 +335,74 @@ def load_for_model(
     x_t, m_t, meta = load_panel(data_dir=data_dir, return_meta=True)
     O_t_list = get_observed_indices(m_t)
     return x_t, m_t, O_t_list, meta
+
+
+def load_missingness_features(
+    data_dir: str | Path = DATA_DIR,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    Load the feature tensor Phi[t, d, k] and associated metadata
+    for the missingness / dropout model.
+
+    These files are produced in `05_Feature_Engineering_for_Missingness_Model.ipynb`:
+
+        - phi_features.npy      : Phi, shape (T, D, K)
+        - time_features.npy     : time-based features, shape (T, F_time)
+        - detector_features.npy : detector-based features, shape (D, F_det)
+        - detector_ids.npy      : alignment between column index d and detector ID
+
+    Convention for feature channels in Phi[:, :, k]:
+
+        k = 0   : intercept (constant 1.0)
+        k = 1–5 : time-based features
+                  [sin(hour), cos(hour),
+                   is_weekend, is_night, is_net_blackout]
+        k = 6–8 : detector-based features
+                  [mean_speed_d, std_speed_d, missing_frac_d]
+
+    Parameters
+    ----------
+    data_dir : str or Path
+        Base data directory (where the *.npy files live).
+
+    Returns
+    -------
+    Phi : np.ndarray, shape (T, D, K), dtype=float32
+        Design tensor for p(m_{t,d} = 1 | phi_{t,d}).
+    meta : dict
+        Metadata with:
+            - "time_features"     : np.ndarray, shape (T, F_time)
+            - "detector_features" : np.ndarray, shape (D, F_det)
+            - "detector_ids"      : np.ndarray, shape (D,)
+    """
+    data_dir = Path(data_dir)
+
+    phi_path      = data_dir / "phi_features.npy"
+    time_path     = data_dir / "time_features.npy"
+    det_path      = data_dir / "detector_features.npy"
+    det_ids_path  = data_dir / "detector_ids.npy"
+
+    if not phi_path.exists():
+        raise FileNotFoundError(
+            f"Could not find '{phi_path.name}' under {data_dir}. "
+            "Run the feature-engineering notebook (05) first."
+        )
+
+    Phi = np.load(phi_path)
+
+    meta: Dict[str, Any] = {}
+
+    if time_path.exists():
+        meta["time_features"] = np.load(time_path)
+    if det_path.exists():
+        meta["detector_features"] = np.load(det_path)
+    if det_ids_path.exists():
+        meta["detector_ids"] = np.load(det_ids_path, allow_pickle=True)
+
+    return Phi, meta
+
+
+# Example (for scripts / notebooks):
+# x_t, m_t, O_t_list, meta = load_for_model()
+# Phi, feat_meta = load_missingness_features()
+# eval_windows = get_eval_windows()
