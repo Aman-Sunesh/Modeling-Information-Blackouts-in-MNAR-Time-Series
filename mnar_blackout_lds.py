@@ -444,11 +444,7 @@ class MNARBlackoutLDS:
             Sigma_smooth = smooth_res["Sigma_smooth"]  # (T, K, K)
 
             # S_t = E[z_t z_t^T] = Σ_{t|T} + μ_{t|T} μ_{t|T}^T
-            S_t = np.zeros_like(Sigma_smooth)
-            for t in range(T):
-                mu_t = mu_smooth[t]               # (K,)
-                Sigma_t = Sigma_smooth[t]         # (K, K)
-                S_t[t] = Sigma_t + np.outer(mu_t, mu_t)
+            S_t = Sigma_smooth + np.einsum("ti,tj->tij", mu_smooth, mu_smooth)
 
             # ------------------------------------------------
             # M-step: Initial state (mu0, Sigma0)
@@ -470,6 +466,10 @@ class MNARBlackoutLDS:
 
             # A_new = (sum_t S_{t,t-1}) (sum_t S_{t-1})^{-1}
             A_new = S_cross_sum @ np.linalg.inv(S_tminus1_sum + 1e-8 * np.eye(K))
+
+            # --- Regularization: shrink A toward identity to keep dynamics stable ---
+            lam_A = 0.05  # e.g., 5% pull toward I; tune if needed
+            A_new = (1.0 - lam_A) * A_new + lam_A * np.eye(K)
 
             # Q_new from:
             #   Q = 1/(T-1) sum_t [
@@ -495,9 +495,21 @@ class MNARBlackoutLDS:
                 Q_accum += term
 
             Q_new = Q_accum / (T - 1)
+            
             # Symmetrize and add jitter for numerical stability
             Q_new = 0.5 * (Q_new + Q_new.T)
             Q_new += 1e-6 * np.eye(K)
+
+            # --- Regularization: shrink Q toward an isotropic prior and cap its scale ---
+            lam_Q = 0.1          # how much to pull Q toward the prior; tune if needed
+            Q_prior = 0.1 * np.eye(K)  # prior process noise level
+            Q_new = (1.0 - lam_Q) * Q_new + lam_Q * Q_prior
+
+            # Cap the overall scale of Q to avoid exploding dynamics
+            max_trace = 100.0    # maximum allowed trace of Q; tune if needed
+            tr_Q = float(np.trace(Q_new))
+            if tr_Q > max_trace:
+                Q_new *= max_trace / tr_Q
 
             # ------------------------------------------------
             # M-step: Emissions (C, R) with masking
@@ -514,42 +526,49 @@ class MNARBlackoutLDS:
                     R_new[d, d] = self.params.R[d, d]
                     continue
 
-                # Sufficient statistics for C_d and R_dd
-                #   numerator = sum_{t in T_d} x_{t,d} mu_t^T       (1 x K)
-                #   denominator = sum_{t in T_d} S_t               (K x K)
-                S_sum_d = np.zeros((K, K), dtype=float)
-                num_d = np.zeros(K, dtype=float)
+                # Vectorized sufficient statistics for C_d and R_dd
+                # Shapes:
+                #   S_obs  : (#obs, K, K)
+                #   mu_obs : (#obs, K)
+                #   x_obs  : (#obs,)
+                S_obs = S_t[obs_idx]                # (N_obs, K, K)
+                mu_obs = mu_smooth[obs_idx]         # (N_obs, K)
+                x_obs = x_t[obs_idx, d].astype(float)  # (N_obs,)
 
-                for t in obs_idx:
-                    x_td = float(x_t[t, d])
-                    mu_t = mu_smooth[t]
-                    S_t_curr = S_t[t]
+                # Denominator: sum_t S_t
+                S_sum_d = S_obs.sum(axis=0)         # (K, K)
 
-                    S_sum_d += S_t_curr
-                    num_d += x_td * mu_t
+                # Numerator: sum_t x_{t,d} mu_t^T
+                # (N_obs, 1) * (N_obs, K) -> (N_obs, K) -> sum over obs
+                num_d = (x_obs[:, None] * mu_obs).sum(axis=0)  # (K,)
 
                 # C_d = num_d (sum_t S_t)^{-1}
                 C_d_row = num_d @ np.linalg.inv(S_sum_d + 1e-8 * np.eye(K))
                 C_new[d, :] = C_d_row
 
-                # R_dd = 1/|T_d| sum_t [ x_{t,d}^2
-                #   - 2 x_{t,d} C_d mu_t + C_d S_t C_d^T ]
-                err_sum = 0.0
-                for t in obs_idx:
-                    x_td = float(x_t[t, d])
-                    mu_t = mu_smooth[t]
-                    S_t_curr = S_t[t]
+                # Now compute R_dd
+                # For each t:
+                #   x_{t,d}^2
+                #   - 2 x_{t,d} (C_d mu_t)
+                #   + C_d S_t C_d^T
+                # Vectorized:
+                #   preds  = C_d mu_t  for all obs
+                #   C_S_Ct = C_d S_t C_d^T  for all obs
 
-                    # scalar: C_d mu_t
-                    C_mu = float(C_d_row @ mu_t)
-                    # scalar: C_d S_t C_d^T
-                    C_S_C = float(C_d_row @ S_t_curr @ C_d_row.T)
+                # preds = C_d mu_t  -> (N_obs,)
+                preds = mu_obs @ C_d_row            # (N_obs,)
 
-                    err_sum += x_td**2 - 2.0 * x_td * C_mu + C_S_C
+                # C_S_C = C_d S_t C_d^T per timestep t
+                # einsum index explanation:
+                #   i   : latent index (for C_d_row left)
+                #   t,i,j : S_obs[t, i, j]
+                #   j   : latent index (for C_d_row right)
+                # Result: (t)
+                C_S_C = np.einsum("i,tij,j->t", C_d_row, S_obs, C_d_row)  # (N_obs,)
 
-                R_dd = err_sum / obs_idx.size
-                # Ensure non-negative variance and add jitter
-                R_dd = max(R_dd, 1e-6)
+                err = x_obs**2 - 2.0 * x_obs * preds + C_S_C             # (N_obs,)
+                R_dd = float(err.mean())
+                R_dd = max(R_dd, 1e-6)    # Ensure non-negative + jitter
                 R_new[d, d] = R_dd
 
             # ------------------------------------------------
