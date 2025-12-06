@@ -501,12 +501,12 @@ class MNARBlackoutLDS:
             Q_new += 1e-6 * np.eye(K)
 
             # --- Regularization: shrink Q toward an isotropic prior and cap its scale ---
-            lam_Q = 0.1          # how much to pull Q toward the prior; tune if needed
+            lam_Q = 0.3          # how much to pull Q toward the prior; tune if needed
             Q_prior = 0.1 * np.eye(K)  # prior process noise level
             Q_new = (1.0 - lam_Q) * Q_new + lam_Q * Q_prior
 
             # Cap the overall scale of Q to avoid exploding dynamics
-            max_trace = 100.0    # maximum allowed trace of Q; tune if needed
+            max_trace = 30.0    # maximum allowed trace of Q; tune if needed
             tr_Q = float(np.trace(Q_new))
             if tr_Q > max_trace:
                 Q_new *= max_trace / tr_Q
@@ -669,7 +669,8 @@ class MNARBlackoutLDS:
     def reconstruct_from_smoother(
         self,
         mu_smooth: np.ndarray,
-    ) -> np.ndarray:
+        Sigma_smooth: np.ndarray,
+    ) -> list[np.ndarray, np.ndarray]:
         """
         Reconstruct x_t from smoothed latent states.
 
@@ -685,11 +686,17 @@ class MNARBlackoutLDS:
         -------
         x_hat : np.ndarray, shape (T, D)
             Reconstructed speed panel.
+        cov : np.ndarray, shape (T, D, D)
+            Reconstructed covariance matrices.
         """
         C = self.params.C
         # Matrix multiply for all T at once:
         # (T, K) @ (K, D)^T  => (T, D)
-        return mu_smooth @ C.T
+        x_hat = mu_smooth @ C.T
+
+        cov = C @ Sigma_smooth @ C.T + self.params.R
+
+        return x_hat, cov
 
     def k_step_forecast(
         self,
