@@ -747,4 +747,3 @@ class MNARBlackoutLDS:
         cov_x = C @ Sigma @ C.T + R              # (D, D)
 
         return mean_x, cov_x
-
