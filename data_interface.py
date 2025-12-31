@@ -68,17 +68,19 @@ def load_panel(
     """
     data_dir = Path(data_dir)
 
+    # Prefer parquet (small, fast); fall back to pickle if needed
     panel_path_parquet = data_dir / "seattle_loop_clean.parquet"
     panel_path_pickle = data_dir / "seattle_loop_clean.pkl"
 
-    # Workaround for pyarrow/pandas extension bug: prefer pickle
-    if panel_path_pickle.exists():
-        wide = pd.read_pickle(panel_path_pickle)
-    elif panel_path_parquet.exists():
-        # Fallback to parquet only if needed
+    if panel_path_parquet.exists():
         wide = pd.read_parquet(panel_path_parquet)
+    elif panel_path_pickle.exists():
+        wide = pd.read_pickle(panel_path_pickle)
     else:
-        raise FileNotFoundError("No seattle_loop_clean parquet/pkl found")
+        raise FileNotFoundError(
+            f"Could not find 'seattle_loop_clean.parquet' or "
+            f"'seattle_loop_clean.pkl' under {data_dir}."
+        )
 
     # Ensure deterministic column order (whatever is in the file)
     wide = wide.sort_index()  # sort by time
@@ -214,7 +216,6 @@ def load_detector_blackouts(
     This encodes our formal definition of a per-detector blackout:
         - a contiguous run of NaNs in the speed panel
         - length >= MIN_LEN steps (MIN_LEN = 2 ⇒ ≥ 10 minutes)
-        - and not touching the first/last time index (structural NA)
 
     Columns typically include:
         - detector    : string detector ID
@@ -406,9 +407,3 @@ def load_missingness_features(
         meta["detector_ids"] = np.load(det_ids_path, allow_pickle=True)
 
     return Phi, meta
-
-
-# Example (for scripts / notebooks):
-# x_t, m_t, O_t_list, meta = load_for_model()
-# Phi, feat_meta = load_missingness_features()
-# eval_windows = get_eval_windows()

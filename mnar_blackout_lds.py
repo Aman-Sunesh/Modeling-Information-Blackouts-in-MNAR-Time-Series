@@ -663,6 +663,72 @@ class MNARBlackoutLDS:
         return history
 
     # --------------------------------------------------------
+    # Calculation of log-likelihood
+    # --------------------------------------------------------
+    def compute_log_likelihood(
+        self,
+        x_t: np.ndarray,
+        m_t: np.ndarray,
+        ekf_results: Dict[str, np.ndarray],
+    ) -> float:
+        """
+        Compute log-likelihood of observed data under the MNAR/MAR LDS.
+
+        This uses the EKF forward pass to compute the one-step-ahead
+        predictive log-likelihood at each time step, then sums over t.
+
+        Parameters
+        ----------
+        x_t : np.ndarray, shape (T, D)
+            Speed panel (NaNs allowed, must match m_t).
+        m_t : np.ndarray, shape (T, D)
+            Missingness indicators (1 = missing, 0 = observed).
+
+        Returns
+        -------
+        log_likelihood : float
+            Total log-likelihood of observed data.
+        """
+        mu_pred = ekf_results["mu_pred"]          # (T, K)
+        Sigma_pred = ekf_results["Sigma_pred"]    # (T, K, K)
+
+        params = self.params
+        A, Q, C, R, phi = params.A, params.Q, params.C, params.R, params.phi
+        mu_t = params.mu0
+        Sigma_t = params.Sigma0
+
+        T, _ = x_t.shape
+        log_likelihood = 0.0
+
+        for t in range(T):
+            if t > 0:
+                mu_t = mu_pred[t]                  # (K,)
+                Sigma_t = Sigma_pred[t]            # (K, K)
+
+            # --- Speed block ---
+            mask_row = m_t[t]                   # (D,)
+            observed_idx = np.where(mask_row == 0)[0]
+            if observed_idx.size > 0:
+                y_x = x_t[t, observed_idx].astype(float)  # (|O_t|,)
+                C_x = C[observed_idx, :]                  # (|O_t|, K)
+                R_x = R[np.ix_(observed_idx, observed_idx)]  # (|O_t|, |O_t|)
+
+                h_x = C_x @ mu_t                           # (|O_t|,)
+                S_x = C_x @ Sigma_t @ C_x.T + R_x         # (|O_t|, |O_t|)
+
+                diff_x = y_x - h_x
+                try:                         # (|O_t|,) Innovation
+                    ll_x = -0.5 * (
+                        diff_x.T @ np.linalg.inv(S_x) @ diff_x
+                        + np.linalg.slogdet(2.0 * np.pi * S_x)[1]
+                    )
+                except np.linalg.LinAlgError:
+                    ll_x = -np.inf
+                    
+                log_likelihood += ll_x
+        return log_likelihood
+
+    # --------------------------------------------------------
     # Reconstruction & forecasting utilities
     # --------------------------------------------------------
 
@@ -747,3 +813,4 @@ class MNARBlackoutLDS:
         cov_x = C @ Sigma @ C.T + R              # (D, D)
 
         return mean_x, cov_x
+
