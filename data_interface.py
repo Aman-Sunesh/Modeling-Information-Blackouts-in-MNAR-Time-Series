@@ -1,4 +1,3 @@
-# ============================================================
 # Module: data_interface
 # ------------------------------------------------------------
 # - Loads the cleaned Seattle loop speed panel (5-min grid)
@@ -68,19 +67,17 @@ def load_panel(
     """
     data_dir = Path(data_dir)
 
-    # Prefer parquet (small, fast); fall back to pickle if needed
     panel_path_parquet = data_dir / "seattle_loop_clean.parquet"
     panel_path_pickle = data_dir / "seattle_loop_clean.pkl"
 
-    if panel_path_parquet.exists():
-        wide = pd.read_parquet(panel_path_parquet)
-    elif panel_path_pickle.exists():
+    # Workaround for pyarrow/pandas extension bug: prefer pickle
+    if panel_path_pickle.exists():
         wide = pd.read_pickle(panel_path_pickle)
+    elif panel_path_parquet.exists():
+        # Fallback to parquet only if needed
+        wide = pd.read_parquet(panel_path_parquet)
     else:
-        raise FileNotFoundError(
-            f"Could not find 'seattle_loop_clean.parquet' or "
-            f"'seattle_loop_clean.pkl' under {data_dir}."
-        )
+        raise FileNotFoundError("No seattle_loop_clean parquet/pkl found")
 
     # Ensure deterministic column order (whatever is in the file)
     wide = wide.sort_index()  # sort by time
@@ -147,6 +144,29 @@ def get_observed_indices(
 
     return O_t_list
 
+def build_time_features(timestamps: np.ndarray) -> np.ndarray:
+    """
+    timestamps: np.ndarray of pandas.Timestamp, shape (T,)
+    Returns: X_time, shape (T, 6)
+      [sin_hour, cos_hour, sin_dow, cos_dow, is_weekend, is_rush]
+    """
+    ts = pd.to_datetime(timestamps)
+    hour = ts.hour.to_numpy() + ts.minute.to_numpy() / 60.0
+    dow = ts.dayofweek.to_numpy()  # Mon=0
+
+    hour_rad = 2.0 * np.pi * (hour / 24.0)
+    dow_rad = 2.0 * np.pi * (dow / 7.0)
+
+    sin_hour = np.sin(hour_rad)
+    cos_hour = np.cos(hour_rad)
+    sin_dow = np.sin(dow_rad)
+    cos_dow = np.cos(dow_rad)
+
+    is_weekend = ((dow >= 5).astype(float))
+    # Simple rush-hour proxy (tune if needed): 7–10 and 16–19
+    is_rush = (((hour >= 7) & (hour <= 10)) | ((hour >= 16) & (hour <= 19))).astype(float)
+
+    return np.stack([sin_hour, cos_hour, sin_dow, cos_dow, is_weekend, is_rush], axis=1)
 
 # ------------------------------------------------------------
 # 3. Evaluation blackout windows
@@ -216,6 +236,7 @@ def load_detector_blackouts(
     This encodes our formal definition of a per-detector blackout:
         - a contiguous run of NaNs in the speed panel
         - length >= MIN_LEN steps (MIN_LEN = 2 ⇒ ≥ 10 minutes)
+        - and not touching the first/last time index (structural NA)
 
     Columns typically include:
         - detector    : string detector ID
@@ -337,6 +358,21 @@ def load_for_model(
     O_t_list = get_observed_indices(m_t)
     return x_t, m_t, O_t_list, meta
 
+def load_for_model_with_time_features(
+    data_dir: str | Path = DATA_DIR,
+) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], Dict[str, Any], np.ndarray]:
+    """
+    Convenience wrapper: load model inputs + engineered time features.
+
+    Returns
+    -------
+    x_t, m_t, O_t_list, meta, X_time
+      - X_time: shape (T, 6) from build_time_features(meta["timestamps"])
+    """
+    x_t, m_t, O_t_list, meta = load_for_model(data_dir=data_dir)
+    X_time = build_time_features(meta["timestamps"])
+    return x_t, m_t, O_t_list, meta, X_time
+
 
 def load_missingness_features(
     data_dir: str | Path = DATA_DIR,
@@ -407,3 +443,9 @@ def load_missingness_features(
         meta["detector_ids"] = np.load(det_ids_path, allow_pickle=True)
 
     return Phi, meta
+
+
+# Example (for scripts / notebooks):
+# x_t, m_t, O_t_list, meta = load_for_model()
+# Phi, feat_meta = load_missingness_features()
+# eval_windows = get_eval_windows()   

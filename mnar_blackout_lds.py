@@ -23,6 +23,42 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
     x_clipped = np.clip(x, -30.0, 30.0)
     return 1.0 / (1.0 + np.exp(-x_clipped))
 
+def _logit(p: np.ndarray | float) -> np.ndarray | float:
+    """
+    Numerically stable logit.
+    Clips p away from {0,1} so intercept initialization can't blow up.
+    """
+    p = np.clip(p, 1e-4, 1.0 - 1e-4)
+    return np.log(p) - np.log1p(-p)
+
+
+def _kf_update_kdim(
+    mu_pred: np.ndarray,          # (K,)
+    Sigma_pred: np.ndarray,       # (K, K)
+    B: np.ndarray,                # (K, K) = J^T R^{-1} J
+    b: np.ndarray,                # (K,)   = J^T R^{-1} (y - h)
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Fast Kalman-style update that only solves KxK systems.
+
+    Uses:
+      Sigma_post = (I + Sigma_pred B)^{-1} Sigma_pred
+      mu_post    = mu_pred + Sigma_post b
+    """
+    K = Sigma_pred.shape[0]
+    I = np.eye(K, dtype=float)
+
+    M = I + Sigma_pred @ B                        # (K, K)
+    Sigma_post = np.linalg.solve(M, Sigma_pred)   # (K, K)
+    delta = Sigma_post @ b                        # (K,)
+    mu_post = mu_pred + delta
+
+    # Symmetrize + jitter for numerical stability
+    Sigma_post = 0.5 * (Sigma_post + Sigma_post.T)
+    Sigma_post += 1e-9 * I
+
+    return mu_post, Sigma_post
+
 
 # ------------------------------------------------------------
 # Parameter container
@@ -44,7 +80,10 @@ class MNARParams:
     R: np.ndarray          # (D, D)  observation noise covariance for speeds
     mu0: np.ndarray        # (K,)    initial mean
     Sigma0: np.ndarray     # (K, K)  initial covariance
-    phi: np.ndarray        # (D, K)  MNAR logistic parameters per detector
+    phi: np.ndarray        # (D, K)       MNAR weights on latent state z_t
+    phi_time: np.ndarray   # (D, F_time)  MNAR weights on time features
+    phi_det: np.ndarray    # (D, F_det)   MNAR weights on detector features
+    bias_m: np.ndarray     # (D,)    MNAR logistic intercept per detector
 
     @property
     def K(self) -> int:
@@ -57,7 +96,7 @@ class MNARParams:
         return self.C.shape[0]
 
     @staticmethod
-    def init_random(K: int, D: int, seed: int = 0) -> "MNARParams":
+    def init_random(K: int, D: int, F_time: int = 0, F_det: int = 0, seed: int = 0) -> "MNARParams":
         """
         Simple random initialization for debugging / experimentation.
         Replace with learned params for real experiments.
@@ -83,9 +122,16 @@ class MNARParams:
 
         # MNAR logistic parameters per detector
         phi = 0.1 * rng.standard_normal((D, K))
+        phi_time = 0.01 * rng.standard_normal((D, F_time)) if F_time > 0 else np.zeros((D, 0), dtype=float)
+        phi_det  = 0.01 * rng.standard_normal((D, F_det))  if F_det  > 0 else np.zeros((D, 0), dtype=float)
+        bias_m = np.zeros(D, dtype=float)
 
-        return MNARParams(A=A, Q=Q, C=C, R=R, mu0=mu0, Sigma0=Sigma0, phi=phi)
-
+        return MNARParams(
+            A=A, Q=Q, C=C, R=R,
+            mu0=mu0, Sigma0=Sigma0,
+            phi=phi, phi_time=phi_time, phi_det=phi_det,
+            bias_m=bias_m
+        )
 
 # ------------------------------------------------------------
 # Core MNAR-aware EKF
@@ -110,8 +156,30 @@ class MNARBlackoutLDS:
         - full masks m_t as an additional "pseudo-observation" block.
     """
 
-    def __init__(self, params: MNARParams):
+    def __init__(
+        self,
+        params: MNARParams,
+        use_missingness_obs: bool = True,
+        missingness_var_mode: str = "moment",
+        missingness_var_const: float = 0.25,
+        missingness_weight: float = 1.0,
+    ):
+        """
+        Parameters
+        ----------
+        use_missingness_obs:
+            If False, inference ignores the mask m_t as a pseudo-observation (MAR-style).
+        missingness_var_mode:
+            "moment"   -> Var ≈ p(1-p) (default)
+            "constant" -> Var = missingness_var_const
+        missingness_var_const:
+            Constant variance value used when missingness_var_mode="constant".
+        """
         self.params = params
+        self.use_missingness_obs = bool(use_missingness_obs)
+        self.missingness_var_mode = str(missingness_var_mode)
+        self.missingness_var_const = float(missingness_var_const)
+        self.missingness_weight = float(missingness_weight)
 
     # --------------------------------------------------------
     # Forward pass: MNAR-aware extended Kalman filter
@@ -121,6 +189,13 @@ class MNARBlackoutLDS:
         self,
         x_t: np.ndarray,
         m_t: np.ndarray,
+        a_t: Optional[np.ndarray] = None,
+        X_time: Optional[np.ndarray] = None,             # (T, F_time)
+        detector_features: Optional[np.ndarray] = None,  # (D, F_det)
+        missingness_var_mode: Optional[str] = None,
+        missingness_var_const: Optional[float] = None,
+        use_missingness_obs: Optional[bool] = None,
+        missingness_weight: Optional[float] = None,
     ) -> Dict[str, np.ndarray]:
         """
         Run MNAR-aware EKF over the entire sequence.
@@ -142,7 +217,14 @@ class MNARBlackoutLDS:
             - 'Sigma_filt': (T, K, K) filtered covs
         """
         params = self.params
-        A, Q, C, R, mu0, Sigma0, phi = (
+
+        # Allow per-call overrides (keeps your notebook/main.py unchanged)
+        use_m = self.use_missingness_obs if use_missingness_obs is None else bool(use_missingness_obs)
+        var_mode = self.missingness_var_mode if missingness_var_mode is None else str(missingness_var_mode)
+        var_const = self.missingness_var_const if missingness_var_const is None else float(missingness_var_const)
+        w_miss = self.missingness_weight if missingness_weight is None else float(missingness_weight)
+
+        A, Q, C, R, mu0, Sigma0, phi, phi_time, phi_det, bias_m = (
             params.A,
             params.Q,
             params.C,
@@ -150,10 +232,20 @@ class MNARBlackoutLDS:
             params.mu0,
             params.Sigma0,
             params.phi,
+            params.phi_time,
+            params.phi_det,
+            params.bias_m,
         )
 
         T, D = x_t.shape
         K = params.K
+
+        # Fast path assumes diagonal R (consistent with init_random + EM R update)
+        R_diag = np.diag(R).copy()
+        inv_R_diag = 1.0 / (R_diag + 1e-9)
+        # Precompute G_d = (1/R_d) * outer(C[d], C[d]) so B_x becomes a fast sum over observed d.
+        # G: (D, K, K)
+        G = inv_R_diag[:, None, None] * (C[:, :, None] * C[:, None, :])
 
         # Allocate arrays for predicted / filtered statistics
         mu_pred = np.zeros((T, K), dtype=float)
@@ -164,8 +256,6 @@ class MNARBlackoutLDS:
         # Start from prior at t = 0
         mu_prev = mu0.copy()
         Sigma_prev = Sigma0.copy()
-
-        I_K = np.eye(K, dtype=float)
 
         for t in range(T):
             # ------------------------------------------------
@@ -183,7 +273,7 @@ class MNARBlackoutLDS:
             # ------------------------------------------------
             mask_row = m_t[t]  # shape (D,)
             # Indices of observed speeds (m = 0)
-            observed_idx = np.where(mask_row == 0)[0]
+            observed_idx = np.where((mask_row == 0) & (~np.isnan(x_t[t])))[0]
             has_speeds = observed_idx.size > 0
 
             # --- Speed block (only if some speeds observed) ---
@@ -195,90 +285,87 @@ class MNARBlackoutLDS:
                 C_x = C[observed_idx, :]                 # (|O_t|, K)
                 h_x = C_x @ mu_t_pred                    # (|O_t|,)
 
-                # Jacobian for speed block is just C_x (linear)
-                J_x = C_x
-
-                # Submatrix of R restricted to observed detectors
-                R_x = R[np.ix_(observed_idx, observed_idx)]  # (|O_t|, |O_t|)
             else:
                 # Placeholders (unused if has_speeds is False)
                 y_x = None
                 h_x = None
-                J_x = None
-                R_x = None
+                C_x = None
 
-            # --- Missingness block (always present) ---
-            # We model probability of m_{t,d} = 1 (missing) as:
-            #   pi_{t,d} = sigma( phi_d^T mu_{t|t-1} )
-            # where phi has shape (D, K) and mu_t_pred has shape (K,).
-            u_m = phi @ mu_t_pred                        # (D,)
-            pi = _sigmoid(u_m)                           # (D,) = P(m=1)
-            # Gradient of sigmoid wrt z:  pi*(1-pi) * phi_d
-            # Shape: (D, K)
-            g = (pi * (1.0 - pi))[:, None] * phi
+            if use_m:
+                # Skip artificially masked entries (evaluation windows)
+                if a_t is None:
+                    keep_idx = np.arange(D)
+                else:
+                    keep_idx = np.where(a_t[t] == 0)[0]
 
-            # Treat m_t as approximate Gaussian observation:
-            #   m_t ≈ pi + g (z_t - mu_t_pred) + epsilon
-            # with Var(epsilon_d) ≈ pi_d (1-pi_d).
-            y_m = mask_row.astype(float)                 # (D,)
-            h_m = pi                                     # (D,)
-            J_m = g                                      # (D, K)
+                if keep_idx.size > 0:
+                    phi_k = phi[keep_idx, :]
+                    y_m   = mask_row[keep_idx].astype(float)
 
-            # Diagonal covariance for missingness pseudo-observations
-            var_m = pi * (1.0 - pi)                      # (D,)
-            # Add small jitter for numerical stability
-            var_m = var_m + 1e-6
-            S_m = np.diag(var_m)                         # (D, D)
+                    # MNAR logits depend on [z_t, time features, detector features]
+                    u_m = bias_m[keep_idx] + (phi_k @ mu_t_pred)
+                    if (X_time is not None) and (phi_time.shape[1] > 0):
+                        u_m = u_m + (phi_time[keep_idx, :] @ X_time[t])
+                    if (detector_features is not None) and (phi_det.shape[1] > 0):
+                        u_m = u_m + np.sum(phi_det[keep_idx, :] * detector_features[keep_idx, :], axis=1)
+                    pi  = _sigmoid(u_m)
 
-            # ------------------------------------------------
-            # 3) Combine blocks and run EKF update
-            # ------------------------------------------------
-            if has_speeds:
-                # Stack observed speeds and missingness:
-                # y = [ y^{(x)} ; y^{(m)} ]
-                y = np.concatenate([y_x, y_m], axis=0)   # (|O_t| + D,)
+                    # Jacobian wrt z only (time/det features don't depend on z)
+                    J_m = (pi * (1.0 - pi))[:, None] * phi_k
+                    h_m = pi
 
-                # h = [ h^{(x)} ; h^{(m)} ]
-                h = np.concatenate([h_x, h_m], axis=0)   # (|O_t| + D,)
+                    if var_mode == "moment":
+                        var_m = pi * (1.0 - pi)
+                    elif var_mode == "constant":
+                        if var_const <= 0:
+                            raise ValueError("missingness_var_const must be > 0")
+                        var_m = np.full(keep_idx.size, var_const, dtype=float)
+                    else:
+                        raise ValueError(f"Unknown missingness_var_mode={var_mode!r}")
 
-                # J = [ J^{(x)} ; J^{(m)} ]
-                J = np.vstack([J_x, J_m])                # (|O_t| + D, K)
-
-                # Block-diagonal covariance:
-                #   R_t = diag(R_x, S_m)
-                top_left = R_x
-                top_right = np.zeros((R_x.shape[0], D), dtype=float)
-                bottom_left = np.zeros((D, R_x.shape[0]), dtype=float)
-                bottom_right = S_m
-                R_t = np.block([
-                    [top_left,    top_right],
-                    [bottom_left, bottom_right],
-                ])
+                    var_m = np.clip(var_m + 1e-6, 1e-6, None)
+                else:
+                    y_m = h_m = J_m = var_m = None
             else:
-                # No speed observations: only missingness block
-                y = y_m                                   # (D,)
-                h = h_m                                   # (D,)
-                J = J_m                                   # (D, K)
-                R_t = S_m                                 # (D, D)
+                y_m = h_m = J_m = var_m = None
 
-            # Innovation covariance: S_y = J Σ J^T + R
-            S_y = J @ Sigma_t_pred @ J.T + R_t
+            # ------------------------------------------------
+            # 3) Fast K-dim EKF update
+            # ------------------------------------------------
+            if (not has_speeds) and (not (use_m and (y_m is not None))):
+                mu_filt[t] = mu_t_pred
+                Sigma_filt[t] = Sigma_t_pred
+                mu_prev = mu_t_pred
+                Sigma_prev = Sigma_t_pred
+                continue
 
-            # Kalman gain: K_t = Σ J^T S_y^{-1}
-            K_t = Sigma_t_pred @ J.T @ np.linalg.inv(S_y)
+            B = np.zeros((K, K), dtype=float)
+            b = np.zeros((K,), dtype=float)
 
-            # Innovation: (y - h(z_pred))
-            innov = y - h
+            # --- Speed contribution (assumes diagonal R) ---
+            if has_speeds:
+                innov_x = y_x - h_x                          # (|O_t|,)
+                # Fast B_x via precomputed G_d sum 
+                B += G[observed_idx].sum(axis=0)
+                b += (innov_x * inv_R_diag[observed_idx]) @ C_x
 
-            # Filtered state mean and covariance
-            mu_t_filt = mu_t_pred + K_t @ innov
-            Sigma_t_filt = (I_K - K_t @ J) @ Sigma_t_pred
+            # --- Missingness contribution (diag variance) ---
+            if use_m and (y_m is not None):
+                innov_m = y_m - h_m
 
-            # Save filtered posterior
+                W_m = (1.0 / var_m)[:, None] * J_m
+                B += w_miss * (J_m.T @ W_m)
+                b += w_miss * (J_m.T @ (innov_m / var_m))
+
+            mu_t_filt, Sigma_t_filt = _kf_update_kdim(
+                mu_pred=mu_t_pred,
+                Sigma_pred=Sigma_t_pred,
+                B=B,
+                b=b,
+            )
+
             mu_filt[t] = mu_t_filt
             Sigma_filt[t] = Sigma_t_filt
-
-            # Prepare for next time step
             mu_prev = mu_t_filt
             Sigma_prev = Sigma_t_filt
 
@@ -336,7 +423,8 @@ class MNARBlackoutLDS:
             Sigma_f = Sigma_filt[t]            # (K, K)
             Sigma_pred_next = Sigma_pred[t + 1]  # (K, K)
 
-            F_t = Sigma_f @ A.T @ np.linalg.inv(Sigma_pred_next)
+            # Solve: Sigma_pred_next^T X^T = (Sigma_f @ A^T)^T  =>  X = (Sigma_f A^T) (Sigma_pred_next)^{-1}
+            F_t = np.linalg.solve(Sigma_pred_next.T, (Sigma_f @ A.T).T).T
 
             # Mean update:
             #   μ_{t|T} = μ_{t|t} + F_t (μ_{t+1|T} - μ_{t+1|t})
@@ -365,12 +453,23 @@ class MNARBlackoutLDS:
         self,
         x_t: np.ndarray,
         m_t: np.ndarray,
+        a_t: Optional[np.ndarray] = None,
+        X_time: Optional[np.ndarray] = None,             # (T, F_time)
+        detector_features: Optional[np.ndarray] = None,  # (D, F_det)
         num_iters: int = 5,
         update_phi: bool = True,
         phi_steps: int = 5,
         phi_lr: float = 1e-3,
         verbose: bool = True,
         convergence_tol: Optional[float] = None,
+        use_missingness_obs: Optional[bool] = None,
+        missingness_var_mode: Optional[str] = None,
+        missingness_var_const: Optional[float] = None,
+        missingness_weight: Optional[float] = None,
+        init_missingness_bias: bool = False,
+        init_phi_if_zero: bool = True,
+        init_phi_noise: float = 1e-3,
+        init_seed: int = 0,
     ) -> Dict[str, Any]:
         """
         Run EM (approximate) for the MNAR LDS on a single sequence.
@@ -422,12 +521,46 @@ class MNARBlackoutLDS:
         T, D = x_t.shape
         K = self.params.K
 
+        # ------------------------------------------------
+        # One-time init: calibrate MNAR intercepts
+        # so p(missing) starts near empirical missing rate,
+        # instead of default 0.5 everywhere (bias=0).
+        # ------------------------------------------------
+        if init_missingness_bias:
+            mr = np.zeros(D, dtype=float)
+            for d in range(D):
+                if a_t is None:
+                    keep = np.ones(T, dtype=bool)
+                else:
+                    keep = (a_t[:, d] == 0)  # exclude artificially masked eval windows
+                # If a detector has no "keep" points, fall back to global rate
+                if np.any(keep):
+                    mr[d] = float(np.mean(m_t[keep, d]))
+                else:
+                    mr[d] = float(np.mean(m_t[:, d]))
+
+            self.params.bias_m[:] = _logit(mr)
+
+            # If phi blocks are exactly zero, add tiny noise to break symmetry
+            if init_phi_if_zero and init_phi_noise > 0:
+                rng = np.random.default_rng(init_seed)
+                if np.allclose(self.params.phi, 0.0):
+                    self.params.phi += init_phi_noise * rng.standard_normal(self.params.phi.shape)
+                if (self.params.phi_time.size > 0) and np.allclose(self.params.phi_time, 0.0):
+                    self.params.phi_time += init_phi_noise * rng.standard_normal(self.params.phi_time.shape)
+                if (self.params.phi_det.size > 0) and np.allclose(self.params.phi_det, 0.0):
+                    self.params.phi_det += init_phi_noise * rng.standard_normal(self.params.phi_det.shape)
+
+
         history = {
             "A": [],
             "Q": [],
             "C": [],
             "R_diag": [],
             "phi": [],
+            "phi_time": [],
+            "phi_det": [],
+            "bias_m": [],
         }
 
         for it in range(num_iters):
@@ -437,7 +570,17 @@ class MNARBlackoutLDS:
             # -------------------------------
             # E-step: EKF + RTS smoother
             # -------------------------------
-            ekf_res = self.ekf_forward(x_t=x_t, m_t=m_t)
+            ekf_res = self.ekf_forward(
+                x_t=x_t,
+                m_t=m_t,
+                a_t=a_t,
+                X_time=X_time,
+                detector_features=detector_features,
+                use_missingness_obs=use_missingness_obs,
+                missingness_var_mode=missingness_var_mode,
+                missingness_var_const=missingness_var_const,
+                missingness_weight=missingness_weight,
+            )
             smooth_res = self.rts_smoother(ekf_res)
 
             mu_smooth = smooth_res["mu_smooth"]        # (T, K)
@@ -506,7 +649,7 @@ class MNARBlackoutLDS:
             Q_new = (1.0 - lam_Q) * Q_new + lam_Q * Q_prior
 
             # Cap the overall scale of Q to avoid exploding dynamics
-            max_trace = 30.0    # maximum allowed trace of Q; tune if needed
+            max_trace = 30.0 # maximum allowed trace of Q; tune if needed
             tr_Q = float(np.trace(Q_new))
             if tr_Q > max_trace:
                 Q_new *= max_trace / tr_Q
@@ -574,31 +717,68 @@ class MNARBlackoutLDS:
             # ------------------------------------------------
             # M-step: Missingness parameters phi (logistic)
             # ------------------------------------------------
-            phi_new = self.params.phi.copy()  # (D, K)
+            phi_new = self.params.phi.copy()      # (D, K)
+            phi_time_new = self.params.phi_time.copy()  # (D, F_time)
+            phi_det_new  = self.params.phi_det.copy()   # (D, F_det)
+            bias_new = self.params.bias_m.copy()  # (D,)
             if update_phi:
                 # Design matrix: smoothed means z_t ≈ mu_{t|T}
                 Z = mu_smooth  # (T, K)
+                Xt = X_time    # (T, F_time) or None
 
                 for d in range(D):
                     # Targets: m_{t,d} in {0,1}
-                    y = m_t[:, d].astype(float)  # (T,)
+                    y_full = m_t[:, d].astype(float)  # (T,)
 
-                    # Current phi_d
+                    # Exclude artificially masked eval windows from the MNAR mechanism fit
+                    if a_t is None:
+                        keep = np.ones(T, dtype=bool)
+                    else:
+                        keep = (a_t[:, d] == 0)
+
+                    Zk = Z[keep]
+                    yk = y_full[keep]
+                    Xk = Xt[keep] if Xt is not None else None
+                    det_vec = detector_features[d] if detector_features is not None else None
+
+                    # Too little data -> skip update for this detector
+                    if Zk.shape[0] < 50:
+                        continue
+
                     phi_d = phi_new[d].copy()   # (K,)
+                    phi_t_d = phi_time_new[d].copy()  # (F_time,) possibly empty
+                    phi_det_d = phi_det_new[d].copy() # (F_det,) possibly empty
+                    b_d = float(bias_new[d])
 
                     for _ in range(phi_steps):
-                        # logits = z_t^T phi_d
-                        logits = Z @ phi_d                      # (T,)
-                        p = _sigmoid(logits)                    # (T,)
+                        logits = b_d + (Zk @ phi_d)
+                        if (Xk is not None) and (phi_t_d.shape[0] > 0):
+                            logits = logits + (Xk @ phi_t_d)
+                        if (det_vec is not None) and (phi_det_d.shape[0] > 0):
+                            logits = logits + float(det_vec @ phi_det_d)  # constant shift across time
+                        p = _sigmoid(logits)                    # (Nk,)
+                        err = (yk - p)                          # (Nk,)
 
-                        # Gradient of log-likelihood:
-                        #   sum_t (y_t - p_t) z_t
-                        grad = Z.T @ (y - p)                    # (K,)
+                        # z-weights
+                        grad_z = Zk.T @ err                     # (K,)
+                        phi_d += (phi_lr / Zk.shape[0]) * grad_z
 
-                        # Gradient-ascent update (scaled by T)
-                        phi_d += (phi_lr / T) * grad
+                        # time-weights
+                        if (Xk is not None) and (phi_t_d.shape[0] > 0):
+                            grad_t = Xk.T @ err                 # (F_time,)
+                            phi_t_d += (phi_lr / Zk.shape[0]) * grad_t
+
+                        # detector-weights (constant features)
+                        if (det_vec is not None) and (phi_det_d.shape[0] > 0):
+                            grad_det = det_vec * float(np.sum(err))   # (F_det,)
+                            phi_det_d += (phi_lr / Zk.shape[0]) * grad_det
+                        # Intercept gradient: sum(yk - p)
+                        b_d   += (phi_lr / Zk.shape[0]) * float(np.sum(err))
 
                     phi_new[d] = phi_d
+                    phi_time_new[d] = phi_t_d
+                    phi_det_new[d]  = phi_det_d
+                    bias_new[d] = b_d
 
             # ------------------------------------------------
             # Compute relative parameter change (for early stop)
@@ -628,6 +808,9 @@ class MNARBlackoutLDS:
                 mu0=mu0_new,
                 Sigma0=Sigma0_new,
                 phi=phi_new,
+                phi_time=phi_time_new,
+                phi_det=phi_det_new,
+                bias_m=bias_new,
             )
 
             # Log history (e.g., for debugging)
@@ -636,6 +819,9 @@ class MNARBlackoutLDS:
             history["C"].append(C_new.copy())
             history["R_diag"].append(np.diag(R_new).copy())
             history["phi"].append(phi_new.copy())
+            history["phi_time"].append(phi_time_new.copy())
+            history["phi_det"].append(phi_det_new.copy())
+            history["bias_m"].append(bias_new.copy())
 
             if verbose:
                 mean_R = float(np.mean(np.diag(R_new)))
@@ -707,7 +893,7 @@ class MNARBlackoutLDS:
 
             # --- Speed block ---
             mask_row = m_t[t]                   # (D,)
-            observed_idx = np.where(mask_row == 0)[0]
+            observed_idx = np.where((mask_row == 0) & (~np.isnan(x_t[t])))[0]
             if observed_idx.size > 0:
                 y_x = x_t[t, observed_idx].astype(float)  # (|O_t|,)
                 C_x = C[observed_idx, :]                  # (|O_t|, K)
@@ -736,9 +922,13 @@ class MNARBlackoutLDS:
         self,
         mu_smooth: np.ndarray,
         Sigma_smooth: np.ndarray,
-    ) -> list[np.ndarray, np.ndarray]:
+        return_cov: bool = False,
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         """
         Reconstruct x_t from smoothed latent states.
+
+        If return_cov=False (default), avoids constructing (T, D, D),
+        which can be extremely large and slow.
 
         Uses:
             x_hat_t = C * mu_{t|T}
@@ -752,16 +942,19 @@ class MNARBlackoutLDS:
         -------
         x_hat : np.ndarray, shape (T, D)
             Reconstructed speed panel.
-        cov : np.ndarray, shape (T, D, D)
-            Reconstructed covariance matrices.
+        cov : Optional[np.ndarray], shape (T, D, D)
+            Reconstructed covariance matrices if return_cov=True, else None.
         """
         C = self.params.C
         # Matrix multiply for all T at once:
         # (T, K) @ (K, D)^T  => (T, D)
         x_hat = mu_smooth @ C.T
 
-        cov = C @ Sigma_smooth @ C.T + self.params.R
+        if not return_cov:
+            return x_hat, None
 
+        # Batch covariance: cov[t] = C @ Sigma_smooth[t] @ C.T + R  -> (T, D, D)
+        cov = np.einsum("ik,tkl,jl->tij", C, Sigma_smooth, C) + self.params.R
         return x_hat, cov
 
     def k_step_forecast(
@@ -813,4 +1006,3 @@ class MNARBlackoutLDS:
         cov_x = C @ Sigma @ C.T + R              # (D, D)
 
         return mean_x, cov_x
-
