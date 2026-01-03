@@ -1,6 +1,10 @@
 numpy
 pandas
 matplotlib
+scipy
+scikit-learn
+torch
+tqdm
 pyarrow
 fastparquet
 tables
