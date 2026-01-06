@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite our preprint(s)."
+type: software
+title: "Modeling Information Blackouts in Missing Not-At-Random Time Series"
+authors:
+  - family-names: Sunesh
+    given-names: Aman
+    orcid: "https://orcid.org/0009-0007-5654-1737"
+  - family-names: Ma
+    given-names: Allan
+  - family-names: Nilol
+    given-names: Siddarth
+repository-code: "https://github.com/BlackoutBayes/Modeling-Information-Blackouts-in-MNAR-Time-Series"
+url: "https://github.com/BlackoutBayes/Modeling-Information-Blackouts-in-MNAR-Time-Series"
+license: CC-BY-4.0
+date-released: "2026-01-04"
+version: "v1"
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.18146529"
+  - type: doi
+    value: "10.48550/arXiv.2601.01480"
+  - type: doi
+    value: "10.31224/6180"
+preferred-citation:
+  type: article
+  title: "Modeling Information Blackouts in Missing Not-At-Random Time Series Data"
+  authors:
+    - family-names: Sunesh
+      given-names: Aman
+      orcid: "https://orcid.org/0009-0007-5654-1737"
+    - family-names: Ma
+      given-names: Allan
+    - family-names: Nilol
+      given-names: Siddarth
+  year: 2026
+  identifiers:
+    - type: doi
+      value: "10.48550/arXiv.2601.01480"
