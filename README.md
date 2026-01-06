@@ -1,5 +1,9 @@
 # Modeling Information Blackouts in MNAR Time Series (Traffic Sensors)
 
+[![arXiv](https://img.shields.io/badge/arXiv-2601.01480-b31b1b.svg)](https://arxiv.org/abs/2601.01480)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18146529.svg)](https://doi.org/10.5281/zenodo.18146529)
+[![engrXiv](https://img.shields.io/badge/engrXiv-10.31224%2F6180-2b6cb0.svg)](https://doi.org/10.31224/6180)
+
 This repository studies **traffic-sensor blackouts** (contiguous missing intervals) and compares **MAR vs MNAR** state-space models for:
 
 - **Blackout imputation**: reconstruct values *inside* blackout windows  
@@ -8,6 +12,19 @@ This repository studies **traffic-sensor blackouts** (contiguous missing interva
 **Core idea:** treat the missingness mask as an *informative observation channel (MNAR)*, not something to ignore or impute away.
 
 > **TL;DR**: an LDS explains the traffic dynamics; a logistic model explains *whether* each sensor is missing given the latent state.
+
+---
+
+## Paper & records
+- **arXiv (canonical):** https://arxiv.org/abs/2601.01480  (DOI: https://doi.org/10.48550/arXiv.2601.01480)
+- **Zenodo (concept DOI = latest):** https://doi.org/10.5281/zenodo.18146528  
+  - **Version v1 DOI:** https://doi.org/10.5281/zenodo.18146529
+- **engrXiv:** https://doi.org/10.31224/6180
+
+## Cite this work
+If you use this repository, please cite the paper (arXiv DOI) and/or Zenodo record.
+- `CITATION.cff` (GitHub “Cite this repository” button)
+- `CITATION.bib` (BibTeX entries for arXiv / Zenodo / engrXiv)
 
 ---
 
