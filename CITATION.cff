@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-message: "If you use this code, please cite our preprint(s)."
+message: "If you use this code, please cite the preprint and the software archive."
 type: software
 title: "Modeling Information Blackouts in Missing Not-At-Random Time Series"
 authors:
@@ -17,7 +17,9 @@ date-released: "2026-01-04"
 version: "v1"
 identifiers:
   - type: doi
-    value: "10.5281/zenodo.18146529"
+    value: "10.5281/zenodo.18184111"
+  - type: doi
+    value: "10.5281/zenodo.18161866"
   - type: doi
     value: "10.48550/arXiv.2601.01480"
   - type: doi
@@ -37,3 +39,4 @@ preferred-citation:
   identifiers:
     - type: doi
       value: "10.48550/arXiv.2601.01480"
+  url: "https://arxiv.org/abs/2601.01480"
